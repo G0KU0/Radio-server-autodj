@@ -1,54 +1,102 @@
 const express = require('express');
-const axios = require('axios');
 const http = require('http');
 const https = require('https');
 const app = express();
 
-// A két rádió linkje
 const PRIMARY_URL = "https://s1.free-shoutcast.com/stream/18240";
 const BACKUP_URL = "https://streaming-01.xtservers.com:7000/stream";
 
-// 1. ÁLLAPOT ELLENŐRZŐ (UptimeRobot-hoz)
-// Ezt a linket rakd be az UptimeRobotba: https://radio-server-autodj.onrender.com/health
+// Ide gyűjtjük a hallgatókat (Winamp, xat, web)
+let clients = new Set();
+let currentSourceUrl = null;
+let sourceRequest = null;
+
+// Ez a függvény küldi a zenét minden csatlakozott hallgatónak
+function broadcast(chunk) {
+    for (let client of clients) {
+        client.write(chunk);
+    }
+}
+
+// Ez a függvény csatlakozik rá a zene forrására (Élő vagy AutoDJ)
+function connectToStream(url) {
+    if (sourceRequest) {
+        sourceRequest.destroy(); // Megállítjuk a korábbi letöltést
+    }
+    
+    currentSourceUrl = url;
+    console.log("Aktív forrás mostantól:", url === PRIMARY_URL ? "ÉLŐ ADÁS" : "AUTODJ");
+
+    const client = url.startsWith('https') ? https : http;
+    
+    sourceRequest = client.get(url, (res) => {
+        // Ahogy jön a zene másodpercenként, azonnal küldjük tovább a hallgatóknak
+        res.on('data', (chunk) => {
+            broadcast(chunk);
+        });
+
+        // Ha véget ér a zene (pl. megszakad az adás)
+        res.on('end', () => {
+            if (url === PRIMARY_URL) {
+                console.log("Élő adás megszakadt! Váltás AutoDJ-re...");
+                connectToStream(BACKUP_URL);
+            }
+        });
+    }).on('error', (err) => {
+        // Ha hiba van a kapcsolódással
+        if (url === PRIMARY_URL) {
+            console.log("Élő adás nem elérhető! Váltás AutoDJ-re...");
+            connectToStream(BACKUP_URL);
+        }
+    });
+}
+
+// Indításkor megpróbálunk az élőre csatlakozni
+connectToStream(PRIMARY_URL);
+
+// HÁTTÉR-FIGYELŐ: 5 másodpercenként nézi, hogy visszatért-e az élő adás
+setInterval(() => {
+    // Csak akkor ellenőrizzük, ha épp az AutoDJ szól
+    if (currentSourceUrl !== PRIMARY_URL) {
+        const client = PRIMARY_URL.startsWith('https') ? https : http;
+        client.get(PRIMARY_URL, (res) => {
+            if (res.statusCode >= 200 && res.statusCode < 400) {
+                console.log("Az Élő adás visszatért! Visszakapcsolás...");
+                res.destroy(); // Csak ellenőriztük, most bontjuk
+                connectToStream(PRIMARY_URL); // Éles váltás!
+            } else {
+                res.destroy();
+            }
+        }).on('error', () => {
+            // Még offline, marad az AutoDJ
+        });
+    }
+}, 5000); // 5000 milliszekundum = 5 másodperc
+
+
+// --- WEBOLDAL ÉS VÉGPONTOK ---
+
+// 1. Ébrentartó az UptimeRobotnak
 app.get('/health', (req, res) => {
-    res.status(200).send('A szerver online és ébren van!');
+    res.status(200).send('Szerver OK!');
 });
 
-// 2. A RÁDIÓ STREAM (Winamp-hoz, xat.com-hoz és a lejátszóhoz)
-// Link: https://radio-server-autodj.onrender.com/radio.mp3
-app.get('/radio.mp3', async (req, res) => {
-    let streamUrl = BACKUP_URL;
-
-    try {
-        // Megnézzük, él-e az elsődleges adás (3 másodperces időkorlát)
-        const response = await axios.head(PRIMARY_URL, { timeout: 3000 });
-        if (response.status >= 200 && response.status < 400) {
-            streamUrl = PRIMARY_URL;
-        }
-    } catch (e) {
-        // Ha hiba van, marad a BACKUP_URL
-        streamUrl = BACKUP_URL;
-    }
-
-    // Kiválasztjuk a megfelelő modult (http vagy https) a link alapján
-    const client = streamUrl.startsWith('https') ? https : http;
-
-    // Fejlécek beállítása a folyamatos lejátszáshoz
+// 2. A fő MP3 link (Ezt tedd a Winampba és a xat.com-ra)
+app.get('/radio.mp3', (req, res) => {
     res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('Connection', 'keep-alive');
     res.setHeader('Cache-Control', 'no-cache');
+    
+    // Hozzáadjuk a hallgatót a listához
+    clients.add(res);
 
-    // A stream átküldése a hallgatónak
-    client.get(streamUrl, (streamRes) => {
-        streamRes.pipe(res);
-    }).on('error', (err) => {
-        console.error("Stream hiba:", err.message);
-        res.end();
+    // Ha a hallgató bezárja a Winampot / kilép a webről, levesszük a listáról
+    req.on('close', () => {
+        clients.delete(res);
     });
 });
 
-// 3. A WEBOLDAL (Fekete háttér, középen a lejátszóval)
-// Link: https://radio-server-autodj.onrender.com
+// 3. A Fekete Weboldal
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
@@ -77,39 +125,10 @@ app.get('/', (req, res) => {
             <audio id="player" controls autoplay>
                 <source src="/radio.mp3" type="audio/mpeg">
             </audio>
-
-            <script>
-                const player = document.getElementById('player');
-                
-                // Ha megszakadna a zene, 2 másodperc múlva automatikusan újraindítja
-                player.onerror = function() {
-                    console.log("Adás megszakadt, újracsatlakozás...");
-                    setTimeout(() => {
-                        player.src = "/radio.mp3?t=" + Date.now();
-                        player.load();
-                        player.play();
-                    }, 2000);
-                };
-
-                // 20 másodpercenként "láthatatlanul" frissíti a forrást, 
-                // hogy ha visszajött az élő adás, átváltson rá
-                setInterval(() => {
-                    fetch('/radio.mp3', { method: 'HEAD' }).then(() => {
-                        // Itt nem kell tenni semmit, a szerver oldali proxy 
-                        // a következő kérésnél már a jót fogja adni.
-                    });
-                }, 20000);
-            </script>
         </body>
         </html>
     `);
 });
 
-// Szerver indítása (Render.com porton)
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-    console.log("-----------------------------------------");
-    console.log("Rádió szerver sikeresen elindult!");
-    console.log("Port: " + PORT);
-    console.log("-----------------------------------------");
-});
+app.listen(PORT, () => console.log(`A szünetmentes rádió elindult a ${PORT} porton!`));
